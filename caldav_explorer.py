@@ -163,10 +163,18 @@ class Child:
 
 class Dav:
     def __init__(self, url: str, username: str, password: str):
-        self.client = caldav.DAVClient(url=url, username=username, password=password)
+        self.url, self.username, self.password = url, username, password
+        self.client = self.make_client(url)
+
+    def make_client(self, url: str) -> caldav.DAVClient:
+        return caldav.DAVClient(url=url, username=self.username, password=self.password)
 
     def connect(self) -> tuple[str, str]:
-        principal = self.client.principal()
+        try:
+            principal = self.client.principal()
+        except caldav.lib.error.NotFoundError:
+            self.client = self.make_client(urljoin(self.url, "/.well-known/caldav"))
+            principal = self.client.principal()
         home = principal.calendar_home_set
         return str(principal.url), str(home.url)
 
@@ -277,6 +285,7 @@ class App:
         self.nodes: dict[str, Node] = {}
         self.results: queue.Queue = queue.Queue()
         self.view_seq = 0
+        self.shown_iid: str | None = None
 
         root.title("CalDAV Explorer")
         style = ttk.Style(root)
@@ -379,7 +388,8 @@ class App:
     def on_connect_failed(self, detail: str):
         self.connect_btn.state(["!disabled"])
         self.login_status.config(
-            text=f"Couldn't connect:\n{detail}", foreground="firebrick"
+            text=f"Couldn't connect:\n{detail.splitlines()[0]}",
+            foreground="firebrick",
         )
 
     def on_connected(self, result):
@@ -455,10 +465,19 @@ class App:
         return iid
 
     def on_open(self, _event=None):
-        iid = self.tree.focus()
-        node = self.nodes.get(iid)
-        if not node or node.loaded or node.kind in ("principal", "file"):
-            return
+        self.root.after_idle(self.load_open_nodes)
+
+    def load_open_nodes(self):
+        for iid, node in list(self.nodes.items()):
+            if (
+                not node.loaded
+                and node.kind not in ("principal", "file")
+                and self.tree.exists(iid)
+                and self.tree.item(iid, "open")
+            ):
+                self.load_children(iid, node)
+
+    def load_children(self, iid: str, node: Node):
         node.loaded = True
         self.set_status(f"Listing {node.url} …")
 
@@ -472,15 +491,19 @@ class App:
 
         def failed(detail: str):
             node.loaded = False
-            self.set_status(f"Couldn't list {node.name}: {detail}")
+            self.tree.delete(*self.tree.get_children(iid))
+            first_line = detail.splitlines()[0]
+            self.tree.insert(iid, "end", text=f"Couldn't load: {first_line}")
+            self.set_status(f"Couldn't list {node.name}: {first_line}")
 
         self.run_bg(lambda: self.dav.list_children(node.url), done, failed)
 
     def on_select(self, _event=None):
         sel = self.tree.selection()
         node = self.nodes.get(sel[0]) if sel else None
-        if not node:
+        if not node or sel[0] == self.shown_iid:
             return
+        self.shown_iid = sel[0]
         self.view_seq += 1
         seq = self.view_seq
         self.show_text(f"Loading {node.url} …")
@@ -499,6 +522,7 @@ class App:
         def failed(detail: str):
             if seq == self.view_seq:
                 self.show_text(f"Error loading {node.url}\n\n{detail}")
+                self.shown_iid = None
                 self.set_status("Error")
 
         self.run_bg(fn, done, failed)
